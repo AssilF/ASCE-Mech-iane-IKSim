@@ -1,4 +1,4 @@
-﻿import processing.event.MouseEvent;
+import processing.event.MouseEvent;
 
 // Processing sketch that visualises a simplified 3D model of the Mech'iane arm
 // and solves inverse kinematics to follow an interactive XYZ target point.
@@ -126,15 +126,31 @@ void drawHUD() {
   text("Position error: " + nf(arm.status.distanceError, 1, 2) + " mm", 16, 54);
   text("Base yaw:" + nf(degrees(arm.baseAngle), 1, 1) + " deg  Shoulder:" + nf(degrees(arm.shoulderAngle), 1, 1)
        + " deg  Elbow:" + nf(degrees(arm.elbowAngle), 1, 1) + " deg  Extension:" + nf(arm.extension, 1, 1) + " mm", 16, 72);
-  text("Status: " + reachState, 16, 90);
+  text("Gripper yaw:" + nf(degrees(arm.gripperYaw), 1, 1) + " deg  Pitch:" + nf(degrees(arm.gripperPitch), 1, 1)
+       + " deg  Roll:" + nf(degrees(arm.gripperRoll), 1, 1) + " deg", 16, 90);
+  text("Status: " + reachState, 16, 108);
 
   textAlign(RIGHT, TOP);
-  text("Controls:\nW/S: target up/down\nA/D: target left/right\nQ/E: target toward/away\nR: reset target  -  SPACE: toggle elbow posture\nMouse drag: orbit camera  -  Wheel: zoom\nHold SHIFT for fine steps", width - 22, height - 118);
+  String controls = "Controls:\n"
+    + "W/S: target up/down\n"
+    + "A/D: target left/right\n"
+    + "Q/E: target toward/away\n"
+    + "R: reset target  -  SPACE: toggle elbow posture\n"
+    + "J/L: gripper yaw left/right\n"
+    + "I/K: gripper pitch up/down\n"
+    + "U/O: gripper roll ccw/cw\n"
+    + "G: reset gripper orientation\n"
+    + "Mouse drag: orbit camera  -  Wheel: zoom\n"
+    + "Hold SHIFT for fine steps";
+  text(controls, width - 22, height - 200);
   hint(ENABLE_DEPTH_TEST);
+
 }
 
 void keyPressed() {
-  float step = (keyEvent != null && keyEvent.isShiftDown()) ? 5 : 20;
+  boolean fine = keyEvent != null && keyEvent.isShiftDown();
+  float step = fine ? 5 : 20;
+  float angleStep = radians(fine ? 2 : 10);
   if (key == 'w' || key == 'W') {
     desiredTarget.y += step;
   } else if (key == 's' || key == 'S') {
@@ -149,10 +165,25 @@ void keyPressed() {
     desiredTarget.z += step;
   } else if (key == 'r' || key == 'R') {
     desiredTarget.set(arm.homeTarget());
+  } else if (key == 'j' || key == 'J') {
+    arm.adjustGripper(-angleStep, 0, 0);
+  } else if (key == 'l' || key == 'L') {
+    arm.adjustGripper(angleStep, 0, 0);
+  } else if (key == 'i' || key == 'I') {
+    arm.adjustGripper(0, angleStep, 0);
+  } else if (key == 'k' || key == 'K') {
+    arm.adjustGripper(0, -angleStep, 0);
+  } else if (key == 'u' || key == 'U') {
+    arm.adjustGripper(0, 0, angleStep);
+  } else if (key == 'o' || key == 'O') {
+    arm.adjustGripper(0, 0, -angleStep);
+  } else if (key == 'g' || key == 'G') {
+    arm.resetGripperOrientation();
   } else if (key == ' ') {
     elbowUpSolution = !elbowUpSolution;
   }
   clampTarget();
+
 }
 
 void mousePressed() {
@@ -216,6 +247,26 @@ void drawBoxCentered(PVector center, float w, float h, float d) {
   popMatrix();
 }
 
+PVector rotateAroundAxis(PVector v, PVector axis, float angle) {
+  if (abs(angle) < 1e-6f) {
+    return v.copy();
+  }
+  PVector k = axis.copy();
+  if (k.magSq() < 1e-6f) {
+    return v.copy();
+  }
+  k.normalize();
+  float cosA = cos(angle);
+  float sinA = sin(angle);
+  PVector term1 = PVector.mult(v, cosA);
+  PVector term2 = PVector.mult(PVector.cross(k, v), sinA);
+  float dotKV = v.dot(k);
+  PVector term3 = PVector.mult(k, dotKV * (1 - cosA));
+  PVector result = PVector.add(term1, term2);
+  result.add(term3);
+  return result;
+}
+
 class ArmKinematics {
   final float baseHeight = 90;
   final float baseRadius = 60;
@@ -229,6 +280,8 @@ class ArmKinematics {
   final float elbowMax = radians(175);
   final float minRadial = 10;
   final float minPlanar = 30;
+  final float gripperAngleMin = radians(-90);
+  final float gripperAngleMax = radians(90);
 
   PVector basePos;
   PVector target;
@@ -241,6 +294,13 @@ class ArmKinematics {
   float wristPitch;
   float wristYaw;
   float extension;
+  float gripperYaw;
+  float gripperPitch;
+  float gripperRoll;
+
+  PVector gripperRight;
+  PVector gripperUp;
+  PVector gripperForward;
 
   IKStatus status;
 
@@ -253,6 +313,12 @@ class ArmKinematics {
       joints[i] = new PVector();
     }
     status = new IKStatus();
+    gripperYaw = 0;
+    gripperPitch = 0;
+    gripperRoll = 0;
+    gripperRight = new PVector(1, 0, 0);
+    gripperUp = new PVector(0, 1, 0);
+    gripperForward = new PVector(0, 0, 1);
   }
 
   PVector homeTarget() {
@@ -368,7 +434,97 @@ class ArmKinematics {
     reachedTarget.set(joints[4]);
     wristPitch = -(shoulderAngle + elbowAngle);
     wristYaw = 0;
+    updateGripperFrame(radialDir, link2Angle);
     status.distanceError = PVector.dist(desired, reachedTarget);
+  }
+
+  void adjustGripper(float yawDelta, float pitchDelta, float rollDelta) {
+    gripperYaw = constrain(gripperYaw + yawDelta, gripperAngleMin, gripperAngleMax);
+    gripperPitch = constrain(gripperPitch + pitchDelta, gripperAngleMin, gripperAngleMax);
+    gripperRoll = constrain(gripperRoll + rollDelta, gripperAngleMin, gripperAngleMax);
+  }
+
+  void resetGripperOrientation() {
+    gripperYaw = 0;
+    gripperPitch = 0;
+    gripperRoll = 0;
+  }
+
+  void updateGripperFrame(PVector radialDir, float link2Angle) {
+    PVector forward = PVector.sub(joints[4], joints[3]);
+    if (forward.magSq() < 1e-5f) {
+      forward = PVector.sub(joints[4], joints[2]);
+    }
+    if (forward.magSq() < 1e-5f) {
+      float forwardRadial = cos(link2Angle);
+      float forwardVertical = sin(link2Angle);
+      forward.set(radialDir.x * forwardRadial, forwardVertical, radialDir.z * forwardRadial);
+    }
+    forward.normalize();
+
+    PVector worldUp = new PVector(0, 1, 0);
+    PVector right = PVector.cross(worldUp, forward);
+    if (right.magSq() < 1e-5f) {
+      right = PVector.cross(radialDir, forward);
+    }
+    if (right.magSq() < 1e-5f) {
+      right.set(1, 0, 0);
+    } else {
+      right.normalize();
+    }
+    PVector up = PVector.cross(forward, right);
+    if (up.magSq() < 1e-5f) {
+      up.set(0, 1, 0);
+    } else {
+      up.normalize();
+    }
+
+    gripperForward.set(forward);
+    gripperRight.set(right);
+    gripperUp.set(up);
+
+    applyGripperServoRotations();
+  }
+
+  void applyGripperServoRotations() {
+    PVector newRight = rotateAroundAxis(gripperRight, gripperUp, gripperYaw);
+    PVector newForward = rotateAroundAxis(gripperForward, gripperUp, gripperYaw);
+    gripperRight.set(newRight);
+    gripperForward.set(newForward);
+
+    PVector newUp = rotateAroundAxis(gripperUp, gripperRight, gripperPitch);
+    newForward = rotateAroundAxis(gripperForward, gripperRight, gripperPitch);
+    gripperUp.set(newUp);
+    gripperForward.set(newForward);
+
+    newRight = rotateAroundAxis(gripperRight, gripperForward, gripperRoll);
+    newUp = rotateAroundAxis(gripperUp, gripperForward, gripperRoll);
+    gripperRight.set(newRight);
+    gripperUp.set(newUp);
+
+    ensureGripperOrthonormal();
+  }
+
+  void ensureGripperOrthonormal() {
+    gripperForward.normalize();
+    gripperRight.normalize();
+
+    PVector up = PVector.cross(gripperForward, gripperRight);
+    if (up.magSq() < 1e-6f) {
+      up = PVector.cross(gripperForward, new PVector(0, 1, 0));
+    }
+    if (up.magSq() < 1e-6f) {
+      up = new PVector(0, 1, 0);
+    }
+    up.normalize();
+    gripperUp.set(up);
+
+    PVector right = PVector.cross(gripperUp, gripperForward);
+    if (right.magSq() < 1e-6f) {
+      right = new PVector(1, 0, 0);
+    }
+    right.normalize();
+    gripperRight.set(right);
   }
 
   void drawArm() {
@@ -409,9 +565,38 @@ class ArmKinematics {
     drawSphere(joints[3], 10);
     fill(220, 250, 255);
     drawSphere(joints[4], 9);
+
+    drawGripper();
+  }
+
+  void drawGripper() {
+    float axisLength = 60;
+    strokeWeight(3);
+    stroke(255, 100, 100);
+    drawLine3d(joints[4], PVector.add(joints[4], PVector.mult(gripperRight, axisLength)));
+    stroke(120, 255, 160);
+    drawLine3d(joints[4], PVector.add(joints[4], PVector.mult(gripperUp, axisLength)));
+    stroke(120, 160, 255);
+    drawLine3d(joints[4], PVector.add(joints[4], PVector.mult(gripperForward, axisLength)));
+
+    float fingerSpacing = 12;
+    float fingerLength = 36;
+    float palmOffset = 28;
+    PVector palmCenter = PVector.add(joints[4], PVector.mult(gripperForward, palmOffset));
+    PVector offset = PVector.mult(gripperRight, fingerSpacing);
+    PVector finger1Base = PVector.add(palmCenter, offset);
+    PVector finger2Base = PVector.sub(palmCenter, offset);
+    PVector finger1Tip = PVector.add(finger1Base, PVector.mult(gripperForward, fingerLength));
+    PVector finger2Tip = PVector.add(finger2Base, PVector.mult(gripperForward, fingerLength));
+
+    stroke(235, 245, 255);
+    strokeWeight(5);
+    drawLine3d(finger1Base, finger1Tip);
+    drawLine3d(finger2Base, finger2Tip);
+    strokeWeight(3);
+    drawLine3d(finger1Base, finger2Base);
   }
 }
-
 class IKStatus {
   boolean reachLimited;
   boolean baseLimited;
