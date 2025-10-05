@@ -5,6 +5,25 @@ import processing.event.MouseEvent;
 ArmKinematics arm;
 PVector desiredTarget;
 
+ControlState controls = new ControlState();
+PVector moveVelocity = new PVector();
+PVector moveVelocityTarget = new PVector();
+float yawVelocity;
+float yawVelocityTarget;
+float pitchVelocity;
+float pitchVelocityTarget;
+float rollVelocity;
+float rollVelocityTarget;
+
+float speedMultiplier = 1.0f;
+final float SPEED_MIN = 0.1f;
+final float SPEED_MAX = 5.0f;
+final float FINE_FACTOR = 0.25f;
+final float BASE_MOVE_SPEED = 220.0f;
+final float BASE_ANGULAR_SPEED = radians(90);
+final float BASE_OPEN_ADJUST_RATE = 2.0f;
+final float BASE_LENGTH_ADJUST_RATE = 40.0f;
+
 float camYaw = radians(45);
 float camPitch = radians(25);
 float camDistance = 900;
@@ -14,26 +33,34 @@ int lastMouseX;
 int lastMouseY;
 boolean elbowUpSolution = false;
 
-void settings() {
-  size(1280, 800, P3D);
-}
+int lastFrameTime;
 
 void setup() {
+  size(1280, 800, P3D);
   surface.setTitle("Mech'iane IK Simulation");
   smooth(8);
   sphereDetail(22);
   arm = new ArmKinematics();
   desiredTarget = arm.target.copy();
   hint(ENABLE_DEPTH_TEST);
+  lastFrameTime = millis();
 }
 
 void draw() {
+  int now = millis();
+  float dt = (now - lastFrameTime) / 1000.0f;
+  dt = constrain(dt, 0.0f, 0.05f);
+
+  updateControlSmoothing(dt);
+
   background(12);
   setLights();
   applyCamera();
   arm.solve(desiredTarget, elbowUpSolution);
   drawScene();
   drawHUD();
+
+  lastFrameTime = now;
 }
 
 void setLights() {
@@ -92,13 +119,10 @@ void drawGroundGrid(float spacing, int count, float y) {
 
 void drawAxes(float length) {
   strokeWeight(2.4);
-  // X axis (red)
   stroke(220, 70, 70);
   drawLine3d(new PVector(0, 0, 0), new PVector(length, 0, 0));
-  // Y axis (green)
   stroke(70, 200, 120);
   drawLine3d(new PVector(0, 0, 0), new PVector(0, length, 0));
-  // Z axis (blue)
   stroke(70, 120, 220);
   drawLine3d(new PVector(0, 0, 0), new PVector(0, 0, length));
 }
@@ -107,9 +131,15 @@ void drawHUD() {
   hint(DISABLE_DEPTH_TEST);
   camera();
   resetMatrix();
-  fill(255);
+
+  float uiScale = constrain(width / 1280.0f, 0.75f, 1.8f);
+  float margin = 18 * uiScale;
+  float lineHeight = 18 * uiScale;
+
   textAlign(LEFT, TOP);
-  textSize(14);
+  textSize(14 * uiScale);
+  float y = margin;
+
   String reachState = arm.status.reachLimited ? "reach limited" : (arm.status.baseLimited ? "base limited" : "ok");
   if (arm.status.minDistanceApplied) {
     reachState += " - min-dist";
@@ -117,73 +147,285 @@ void drawHUD() {
   if (arm.status.radialAdjusted) {
     reachState += " - radial clamp";
   }
+  if (arm.status.shoulderLimited) {
+    reachState += " - shoulder clamp";
+  }
+  if (arm.status.elbowLimited) {
+    reachState += " - elbow clamp";
+  }
+
   text("Target (mm)  X:" + nf(desiredTarget.x, 1, 1)
        + "  Y:" + nf(desiredTarget.y, 1, 1)
-       + "  Z:" + nf(desiredTarget.z, 1, 1), 16, 18);
+       + "  Z:" + nf(desiredTarget.z, 1, 1), margin, y);
+  y += lineHeight;
   text("End effector  X:" + nf(arm.reachedTarget.x, 1, 1)
        + "  Y:" + nf(arm.reachedTarget.y, 1, 1)
-       + "  Z:" + nf(arm.reachedTarget.z, 1, 1), 16, 36);
-  text("Position error: " + nf(arm.status.distanceError, 1, 2) + " mm", 16, 54);
+       + "  Z:" + nf(arm.reachedTarget.z, 1, 1), margin, y);
+  y += lineHeight;
+  text("Position error: " + nf(arm.status.distanceError, 1, 2) + " mm", margin, y);
+  y += lineHeight;
   text("Base yaw:" + nf(degrees(arm.baseAngle), 1, 1) + " deg  Shoulder:" + nf(degrees(arm.shoulderAngle), 1, 1)
-       + " deg  Elbow:" + nf(degrees(arm.elbowAngle), 1, 1) + " deg  Extension:" + nf(arm.extension, 1, 1) + " mm", 16, 72);
+       + " deg  Elbow:" + nf(degrees(arm.elbowAngle), 1, 1) + " deg  Extension:" + nf(arm.extension, 1, 1) + " mm", margin, y);
+  y += lineHeight;
   text("Gripper yaw:" + nf(degrees(arm.gripperYaw), 1, 1) + " deg  Pitch:" + nf(degrees(arm.gripperPitch), 1, 1)
-       + " deg  Roll:" + nf(degrees(arm.gripperRoll), 1, 1) + " deg", 16, 90);
-  text("Status: " + reachState, 16, 108);
+       + " deg  Roll:" + nf(degrees(arm.gripperRoll), 1, 1) + " deg", margin, y);
+  y += lineHeight;
+  text("Gripper open: " + nf(arm.gripperOpenAmount * 100, 1, 0) + "%", margin, y);
+  y += lineHeight;
+  text("Segments [mm]  Shoulder:" + nf(arm.shoulderLength, 1, 1)
+       + "  Elbow:" + nf(arm.elbowLength, 1, 1)
+       + "  Extension max:" + nf(arm.extensionMax, 1, 1), margin, y);
+  y += lineHeight;
+  text("Speed multiplier x" + nf(speedMultiplier, 1, 2) + (controls.shiftHeld ? "  (fine)" : ""), margin, y);
+  y += lineHeight;
+  text("Status: " + reachState, margin, y);
 
   textAlign(RIGHT, TOP);
-  String controls = "Controls:\n"
-    + "W/S: target up/down\n"
-    + "A/D: target left/right\n"
-    + "Q/E: target toward/away\n"
-    + "R: reset target  -  SPACE: toggle elbow posture\n"
-    + "J/L: gripper yaw left/right\n"
-    + "I/K: gripper pitch up/down\n"
-    + "U/O: gripper roll ccw/cw\n"
-    + "G: reset gripper orientation\n"
-    + "Mouse drag: orbit camera  -  Wheel: zoom\n"
-    + "Hold SHIFT for fine steps";
-  text(controls, width - 22, height - 200);
-  hint(ENABLE_DEPTH_TEST);
+  textSize(13 * uiScale);
+  textLeading(lineHeight);
+  String controlsText = "Controls:\n"
+    + "Hold keys for continuous motion\n"
+    + "W/S: target up/down    A/D: target left/right\n"
+    + "Q/E: target toward/away    Shift: fine speed\n"
+    + "J/L: gripper yaw    I/K: gripper pitch\n"
+    + "U/O: gripper roll    [/]: gripper close/open\n"
+    + "P: toggle gripper    G: reset gripper angles\n"
+    + "Z/X: shoulder length -/+\n"
+    + "C/V: elbow length -/+    B/N: extension max -/+\n"
+    + "-/=: speed multiplier -/+    0: reset speed\n"
+    + "R: reset target    Space: toggle elbow\n"
+    + "Mouse drag: orbit camera    Wheel: zoom";
+  text(controlsText, width - margin, margin);
 
+  hint(ENABLE_DEPTH_TEST);
+}
+
+void updateControlSmoothing(float dt) {
+  float blend = constrain(dt * 10.0f, 0, 1);
+  float moveSpeed = BASE_MOVE_SPEED * speedMultiplier * (controls.shiftHeld ? FINE_FACTOR : 1.0f);
+
+  moveVelocityTarget.set(
+    moveSpeed * dir(controls.moveRight, controls.moveLeft),
+    moveSpeed * dir(controls.moveUp, controls.moveDown),
+    moveSpeed * dir(controls.moveAway, controls.moveToward)
+  );
+  moveVelocity.lerp(moveVelocityTarget, blend);
+  desiredTarget.x += moveVelocity.x * dt;
+  desiredTarget.y += moveVelocity.y * dt;
+  desiredTarget.z += moveVelocity.z * dt;
+
+  float angularSpeed = BASE_ANGULAR_SPEED * speedMultiplier * (controls.shiftHeld ? FINE_FACTOR : 1.0f);
+  yawVelocityTarget = angularSpeed * dir(controls.yawRight, controls.yawLeft);
+  pitchVelocityTarget = angularSpeed * dir(controls.pitchUp, controls.pitchDown);
+  rollVelocityTarget = angularSpeed * dir(controls.rollCcw, controls.rollCw);
+
+  yawVelocity += (yawVelocityTarget - yawVelocity) * blend;
+  pitchVelocity += (pitchVelocityTarget - pitchVelocity) * blend;
+  rollVelocity += (rollVelocityTarget - rollVelocity) * blend;
+
+  arm.adjustGripper(yawVelocity * dt, pitchVelocity * dt, rollVelocity * dt);
+
+  float openAdjustSpeed = BASE_OPEN_ADJUST_RATE * (controls.shiftHeld ? FINE_FACTOR : 1.0f);
+  float openDir = dir(controls.gripperOpen, controls.gripperClose);
+  if (openDir != 0) {
+    arm.nudgeGripperOpen(openDir * openAdjustSpeed * dt);
+  }
+  arm.updateGripperOpen(dt);
+
+  float lengthAdjustSpeed = BASE_LENGTH_ADJUST_RATE * (controls.shiftHeld ? FINE_FACTOR : 1.0f);
+  float shoulderDir = dir(controls.shoulderIncrease, controls.shoulderDecrease);
+  if (shoulderDir != 0) {
+    arm.adjustShoulderLength(shoulderDir * lengthAdjustSpeed * dt);
+  }
+  float elbowDir = dir(controls.elbowIncrease, controls.elbowDecrease);
+  if (elbowDir != 0) {
+    arm.adjustElbowLength(elbowDir * lengthAdjustSpeed * dt);
+  }
+  float extensionDir = dir(controls.extensionIncrease, controls.extensionDecrease);
+  if (extensionDir != 0) {
+    arm.adjustExtensionMax(extensionDir * (lengthAdjustSpeed + 20.0f) * dt);
+  }
+
+  clampTarget();
+}
+
+int dir(boolean positive, boolean negative) {
+  return (positive ? 1 : 0) - (negative ? 1 : 0);
+}
+
+void setSpeedMultiplier(float value) {
+  speedMultiplier = constrain(value, SPEED_MIN, SPEED_MAX);
 }
 
 void keyPressed() {
-  boolean fine = keyEvent != null && keyEvent.isShiftDown();
-  float step = fine ? 5 : 20;
-  float angleStep = radians(fine ? 2 : 10);
-  if (key == 'w' || key == 'W') {
-    desiredTarget.y += step;
-  } else if (key == 's' || key == 'S') {
-    desiredTarget.y -= step;
-  } else if (key == 'a' || key == 'A') {
-    desiredTarget.x -= step;
-  } else if (key == 'd' || key == 'D') {
-    desiredTarget.x += step;
-  } else if (key == 'q' || key == 'Q') {
-    desiredTarget.z -= step;
-  } else if (key == 'e' || key == 'E') {
-    desiredTarget.z += step;
-  } else if (key == 'r' || key == 'R') {
-    desiredTarget.set(arm.homeTarget());
-  } else if (key == 'j' || key == 'J') {
-    arm.adjustGripper(-angleStep, 0, 0);
-  } else if (key == 'l' || key == 'L') {
-    arm.adjustGripper(angleStep, 0, 0);
-  } else if (key == 'i' || key == 'I') {
-    arm.adjustGripper(0, angleStep, 0);
-  } else if (key == 'k' || key == 'K') {
-    arm.adjustGripper(0, -angleStep, 0);
-  } else if (key == 'u' || key == 'U') {
-    arm.adjustGripper(0, 0, angleStep);
-  } else if (key == 'o' || key == 'O') {
-    arm.adjustGripper(0, 0, -angleStep);
-  } else if (key == 'g' || key == 'G') {
-    arm.resetGripperOrientation();
-  } else if (key == ' ') {
-    elbowUpSolution = !elbowUpSolution;
+  if (key == CODED) {
+    if (keyCode == SHIFT) {
+      controls.shiftHeld = true;
+    }
+    return;
   }
-  clampTarget();
 
+  if (key == '[') {
+    controls.gripperClose = true;
+  } else if (key == ']') {
+    controls.gripperOpen = true;
+  } else if (key == '-' || key == '_') {
+    setSpeedMultiplier(speedMultiplier * 0.8f);
+  } else if (key == '=' || key == '+') {
+    setSpeedMultiplier(speedMultiplier * 1.25f);
+  }
+
+  if (key == ' ') {
+    elbowUpSolution = !elbowUpSolution;
+    return;
+  }
+
+  char k = Character.toLowerCase(key);
+  switch (k) {
+  case 'w':
+    controls.moveUp = true;
+    break;
+  case 's':
+    controls.moveDown = true;
+    break;
+  case 'a':
+    controls.moveLeft = true;
+    break;
+  case 'd':
+    controls.moveRight = true;
+    break;
+  case 'q':
+    controls.moveToward = true;
+    break;
+  case 'e':
+    controls.moveAway = true;
+    break;
+  case 'j':
+    controls.yawLeft = true;
+    break;
+  case 'l':
+    controls.yawRight = true;
+    break;
+  case 'i':
+    controls.pitchUp = true;
+    break;
+  case 'k':
+    controls.pitchDown = true;
+    break;
+  case 'u':
+    controls.rollCcw = true;
+    break;
+  case 'o':
+    controls.rollCw = true;
+    break;
+  case 'z':
+    controls.shoulderDecrease = true;
+    break;
+  case 'x':
+    controls.shoulderIncrease = true;
+    break;
+  case 'c':
+    controls.elbowDecrease = true;
+    break;
+  case 'v':
+    controls.elbowIncrease = true;
+    break;
+  case 'b':
+    controls.extensionDecrease = true;
+    break;
+  case 'n':
+    controls.extensionIncrease = true;
+    break;
+  case 'r':
+    desiredTarget.set(arm.homeTarget());
+    moveVelocity.set(0, 0, 0);
+    moveVelocityTarget.set(0, 0, 0);
+    break;
+  case 'g':
+    arm.resetGripperOrientation();
+    yawVelocity = pitchVelocity = rollVelocity = 0;
+    yawVelocityTarget = pitchVelocityTarget = rollVelocityTarget = 0;
+    break;
+  case 'p':
+    arm.toggleGripperOpen();
+    break;
+  case '0':
+    setSpeedMultiplier(1.0f);
+    break;
+  }
+}
+
+void keyReleased() {
+  if (key == CODED) {
+    if (keyCode == SHIFT) {
+      controls.shiftHeld = false;
+    }
+    return;
+  }
+
+  if (key == '[') {
+    controls.gripperClose = false;
+  } else if (key == ']') {
+    controls.gripperOpen = false;
+  }
+
+  char k = Character.toLowerCase(key);
+  switch (k) {
+  case 'w':
+    controls.moveUp = false;
+    break;
+  case 's':
+    controls.moveDown = false;
+    break;
+  case 'a':
+    controls.moveLeft = false;
+    break;
+  case 'd':
+    controls.moveRight = false;
+    break;
+  case 'q':
+    controls.moveToward = false;
+    break;
+  case 'e':
+    controls.moveAway = false;
+    break;
+  case 'j':
+    controls.yawLeft = false;
+    break;
+  case 'l':
+    controls.yawRight = false;
+    break;
+  case 'i':
+    controls.pitchUp = false;
+    break;
+  case 'k':
+    controls.pitchDown = false;
+    break;
+  case 'u':
+    controls.rollCcw = false;
+    break;
+  case 'o':
+    controls.rollCw = false;
+    break;
+  case 'z':
+    controls.shoulderDecrease = false;
+    break;
+  case 'x':
+    controls.shoulderIncrease = false;
+    break;
+  case 'c':
+    controls.elbowDecrease = false;
+    break;
+  case 'v':
+    controls.elbowIncrease = false;
+    break;
+  case 'b':
+    controls.extensionDecrease = false;
+    break;
+  case 'n':
+    controls.extensionIncrease = false;
+    break;
+  }
 }
 
 void mousePressed() {
@@ -196,7 +438,7 @@ void mousePressed() {
 
 void mouseDragged() {
   if (rotatingCamera) {
-    float sensitivity = 0.01;
+    float sensitivity = 0.01f;
     camYaw += (mouseX - lastMouseX) * sensitivity;
     camPitch -= (mouseY - lastMouseY) * sensitivity;
     camPitch = constrain(camPitch, radians(-5), radians(85));
@@ -215,10 +457,13 @@ void mouseWheel(MouseEvent event) {
 }
 
 void clampTarget() {
-  float horizontal = 320;
+  float horizontal = max(120, arm.maxPlanarReach() * 1.05f);
   desiredTarget.x = constrain(desiredTarget.x, -horizontal, horizontal);
   desiredTarget.z = constrain(desiredTarget.z, -horizontal, horizontal);
-  desiredTarget.y = constrain(desiredTarget.y, 40, arm.basePos.y + 280);
+
+  float minHeight = 40;
+  float maxHeight = arm.basePos.y + max(arm.shoulderLength + arm.elbowLength, 150);
+  desiredTarget.y = constrain(desiredTarget.y, minHeight, maxHeight);
 }
 
 PVector mechToP3D(PVector v) {
@@ -259,7 +504,7 @@ PVector rotateAroundAxis(PVector v, PVector axis, float angle) {
   float cosA = cos(angle);
   float sinA = sin(angle);
   PVector term1 = PVector.mult(v, cosA);
-  PVector term2 = PVector.mult(PVector.cross(k, v), sinA);
+  PVector term2 = PVector.mult(k.copy().cross(v), sinA);
   float dotKV = v.dot(k);
   PVector term3 = PVector.mult(k, dotKV * (1 - cosA));
   PVector result = PVector.add(term1, term2);
@@ -267,12 +512,40 @@ PVector rotateAroundAxis(PVector v, PVector axis, float angle) {
   return result;
 }
 
+class ControlState {
+  boolean moveUp;
+  boolean moveDown;
+  boolean moveLeft;
+  boolean moveRight;
+  boolean moveToward;
+  boolean moveAway;
+
+  boolean yawLeft;
+  boolean yawRight;
+  boolean pitchUp;
+  boolean pitchDown;
+  boolean rollCcw;
+  boolean rollCw;
+
+  boolean gripperOpen;
+  boolean gripperClose;
+
+  boolean shoulderIncrease;
+  boolean shoulderDecrease;
+  boolean elbowIncrease;
+  boolean elbowDecrease;
+  boolean extensionIncrease;
+  boolean extensionDecrease;
+
+  boolean shiftHeld;
+}
+
 class ArmKinematics {
-  final float baseHeight = 90;
-  final float baseRadius = 60;
-  final float shoulderLength = 140;
-  final float elbowLength = 110;
-  final float extensionMax = 110;
+  float baseHeight = 90;
+  float baseRadius = 60;
+  float shoulderLength = 140;
+  float elbowLength = 110;
+  float extensionMax = 110;
   final float baseYawLimit = radians(135);
   final float shoulderMin = radians(-10);
   final float shoulderMax = radians(175);
@@ -302,6 +575,9 @@ class ArmKinematics {
   PVector gripperUp;
   PVector gripperForward;
 
+  float gripperOpenAmount = 1.0f;
+  float gripperOpenTarget = 1.0f;
+
   IKStatus status;
 
   ArmKinematics() {
@@ -322,7 +598,9 @@ class ArmKinematics {
   }
 
   PVector homeTarget() {
-    return new PVector(basePos.x + 160, basePos.y + 120, 140);
+    float planar = (shoulderLength + elbowLength) * 0.6f;
+    float height = basePos.y + max(70, shoulderLength * 0.55f);
+    return new PVector(basePos.x + planar, height, 140);
   }
 
   void solve(PVector desired, boolean elbowUp) {
@@ -463,16 +741,16 @@ class ArmKinematics {
     forward.normalize();
 
     PVector worldUp = new PVector(0, 1, 0);
-    PVector right = PVector.cross(worldUp, forward);
+    PVector right = worldUp.copy().cross(forward);
     if (right.magSq() < 1e-5f) {
-      right = PVector.cross(radialDir, forward);
+      right = radialDir.copy().cross(forward);
     }
     if (right.magSq() < 1e-5f) {
       right.set(1, 0, 0);
     } else {
       right.normalize();
     }
-    PVector up = PVector.cross(forward, right);
+    PVector up = forward.copy().cross(right);
     if (up.magSq() < 1e-5f) {
       up.set(0, 1, 0);
     } else {
@@ -509,9 +787,9 @@ class ArmKinematics {
     gripperForward.normalize();
     gripperRight.normalize();
 
-    PVector up = PVector.cross(gripperForward, gripperRight);
+    PVector up = gripperForward.copy().cross(gripperRight);
     if (up.magSq() < 1e-6f) {
-      up = PVector.cross(gripperForward, new PVector(0, 1, 0));
+      up = gripperForward.copy().cross(new PVector(0, 1, 0));
     }
     if (up.magSq() < 1e-6f) {
       up = new PVector(0, 1, 0);
@@ -519,7 +797,7 @@ class ArmKinematics {
     up.normalize();
     gripperUp.set(up);
 
-    PVector right = PVector.cross(gripperUp, gripperForward);
+    PVector right = gripperUp.copy().cross(gripperForward);
     if (right.magSq() < 1e-6f) {
       right = new PVector(1, 0, 0);
     }
@@ -528,34 +806,28 @@ class ArmKinematics {
   }
 
   void drawArm() {
-    // Base platform
     noStroke();
     fill(50, 55, 65);
     drawBoxCentered(new PVector(basePos.x, baseHeight / 2f, basePos.z), baseRadius * 2.2, baseHeight, baseRadius * 2.2);
     fill(80, 90, 110);
     drawBoxCentered(new PVector(basePos.x, basePos.y - 8, basePos.z), baseRadius * 2.6, 16, baseRadius * 2.6);
 
-    // Base column
     stroke(140, 180, 240);
     strokeWeight(9);
     drawLine3d(joints[0], joints[1]);
 
-    // Shoulder link
     stroke(255, 170, 60);
     strokeWeight(7);
     drawLine3d(joints[1], joints[2]);
 
-    // Elbow link (before extension)
     stroke(255, 220, 120);
     strokeWeight(6);
     drawLine3d(joints[2], joints[3]);
 
-    // Prismatic extension
     stroke(90, 240, 190);
     strokeWeight(5);
     drawLine3d(joints[3], joints[4]);
 
-    // Joints markers
     noStroke();
     fill(200);
     drawSphere(joints[1], 12);
@@ -579,15 +851,25 @@ class ArmKinematics {
     stroke(120, 160, 255);
     drawLine3d(joints[4], PVector.add(joints[4], PVector.mult(gripperForward, axisLength)));
 
-    float fingerSpacing = 12;
-    float fingerLength = 36;
-    float palmOffset = 28;
+    float fingerSpacingClosed = 3;
+    float fingerSpacingOpen = 14;
+    float fingerSpacing = lerp(fingerSpacingClosed, fingerSpacingOpen, gripperOpenAmount);
+
+    float fingerLengthClosed = 22;
+    float fingerLengthOpen = 36;
+    float fingerLength = lerp(fingerLengthClosed, fingerLengthOpen, gripperOpenAmount);
+
+    float palmOffsetClosed = 20;
+    float palmOffsetOpen = 28;
+    float palmOffset = lerp(palmOffsetClosed, palmOffsetOpen, gripperOpenAmount);
+
     PVector palmCenter = PVector.add(joints[4], PVector.mult(gripperForward, palmOffset));
     PVector offset = PVector.mult(gripperRight, fingerSpacing);
     PVector finger1Base = PVector.add(palmCenter, offset);
     PVector finger2Base = PVector.sub(palmCenter, offset);
-    PVector finger1Tip = PVector.add(finger1Base, PVector.mult(gripperForward, fingerLength));
-    PVector finger2Tip = PVector.add(finger2Base, PVector.mult(gripperForward, fingerLength));
+    PVector forwardOffset = PVector.mult(gripperForward, fingerLength);
+    PVector finger1Tip = PVector.add(finger1Base, forwardOffset);
+    PVector finger2Tip = PVector.add(finger2Base, forwardOffset);
 
     stroke(235, 245, 255);
     strokeWeight(5);
@@ -596,7 +878,42 @@ class ArmKinematics {
     strokeWeight(3);
     drawLine3d(finger1Base, finger2Base);
   }
+
+  void nudgeGripperOpen(float delta) {
+    gripperOpenTarget = constrain(gripperOpenTarget + delta, 0, 1);
+  }
+
+  void toggleGripperOpen() {
+    gripperOpenTarget = gripperOpenTarget < 0.5f ? 1.0f : 0.0f;
+  }
+
+  void updateGripperOpen(float dt) {
+    float chaseSpeed = 6.0f;
+    float diff = gripperOpenTarget - gripperOpenAmount;
+    if (abs(diff) > 1e-4f) {
+      float step = constrain(diff, -chaseSpeed * dt, chaseSpeed * dt);
+      gripperOpenAmount += step;
+    }
+  }
+
+  void adjustShoulderLength(float delta) {
+    shoulderLength = constrain(shoulderLength + delta, 80, 260);
+  }
+
+  void adjustElbowLength(float delta) {
+    elbowLength = constrain(elbowLength + delta, 60, 220);
+  }
+
+  void adjustExtensionMax(float delta) {
+    extensionMax = constrain(extensionMax + delta, 30, 220);
+    extension = constrain(extension, 0, extensionMax);
+  }
+
+  float maxPlanarReach() {
+    return shoulderLength + elbowLength + extensionMax;
+  }
 }
+
 class IKStatus {
   boolean reachLimited;
   boolean baseLimited;
